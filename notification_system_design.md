@@ -740,5 +740,129 @@ function email_worker(job):
 - Idempotency key (`job_id`) prevents duplicate emails if a worker crashes mid-send and the job is requeued
 - Real-time SSE push is instant and independent of email delivery time
 
+---
+
+## Stage 6
+
+### Problem
+
+The product manager wants a **Priority Inbox** that always shows the top N most important unread notifications first. Priority is determined by a combination of:
+
+- **Type weight**: `Placement > Result > Event`
+- **Recency**: More recently created notifications rank higher within the same type
+
+---
+
+### Priority Scoring Algorithm
+
+Each notification is assigned a numeric priority score:
+
+```
+score = typeWeight × 10¹³ + timestamp_ms
+```
+
+| Type | Weight | Effect |
+|---|---|---|
+| `Placement` | 3 | score ≈ 3.x × 10¹³ |
+| `Result` | 2 | score ≈ 2.x × 10¹³ |
+| `Event` | 1 | score ≈ 1.x × 10¹³ |
+
+The `10¹³` multiplier ensures **type always dominates**. Within the same type, `timestamp_ms` (Unix time in milliseconds, ~13 digits) breaks the tie so more recent notifications rank higher.
+
+**Example**: A `Placement` from last week always outranks a `Result` from today.
+
+---
+
+### Implementation — `priority_inbox/index.js`
+
+**Language**: JavaScript (Node.js)
+
+**Approach**:
+1. Fetch all notifications from `GET /evaluation-service/notifications` using `Bearer` token
+2. Score each notification using the formula above
+3. Use a **min-heap of size N** to find top N in a single O(m log N) pass over all notifications
+4. Print results sorted by priority descending
+
+**Run the top 10:**
+
+```bash
+cd priority_inbox
+node index.js 10
+```
+
+**Run for any N:**
+
+```bash
+node index.js 15
+node index.js 20
+```
+
+---
+
+### Sample Output (Top 10)
+
+```
+Fetching notifications...
+Total received: 20 notifications
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ PRIORITY INBOX — Top 10 Notifications  (Placement > Result > Event, then by recency)
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ Rank  Type          Message                          Timestamp              Priority Score
+────────────────────────────────────────────────────────────────────────────────────────────────────
+    1. Placement     Booking Holdings Inc. hiring    2026-05-09 03:50:05     3.1778e+13
+    2. Placement     Amazon.com Inc. hiring          2026-05-09 03:19:01     3.1778e+13
+    3. Placement     Tesla Inc. hiring               2026-05-08 19:49:25     3.1778e+13
+    4. Placement     Meta Platforms Inc. hiring      2026-05-08 19:18:13     3.1778e+13
+    5. Placement     Nvidia Corporation hiring       2026-05-08 16:48:53     3.1778e+13
+    6. Placement     Meta Platforms Inc. hiring      2026-05-08 16:20:29     3.1778e+13
+    7. Placement     Microsoft Corporation hiring    2026-05-08 13:48:21     3.1778e+13
+    8. Placement     Tesla Inc. hiring               2026-05-08 11:49:49     3.1778e+13
+    9. Placement     Meta Platforms Inc. hiring      2026-05-08 06:20:45     3.1778e+13
+   10. Result        project-review                  2026-05-09 05:18:45     2.1778e+13
+────────────────────────────────────────────────────────────────────────────────────────────────────
+```
+
+---
+
+### How to Maintain Top N Efficiently as New Notifications Arrive
+
+When notifications stream in continuously, re-sorting the entire list on every arrival is O(m log m) — too slow for real-time use. The efficient approach uses a **min-heap of fixed size N**:
+
+**Algorithm:**
+
+```
+heap = MinHeap(capacity = N)   # min-heap ordered by priority score
+
+function on_new_notification(notif):
+    scored = compute_score(notif)
+
+    if heap.size() < N:
+        heap.push(scored)                        # heap not full yet — always add
+
+    else if scored.score > heap.peek().score:    # new notif beats the current lowest in top N
+        heap.pop()                               # evict the lowest-priority item
+        heap.push(scored)                        # insert the new one
+
+    # if scored.score <= heap.peek().score — new notif doesn't make top N, ignore it
+```
+
+**Complexity per new notification**: O(log N) — constant relative to the stream volume.
+
+**Why a min-heap?**
+
+The heap always exposes its **minimum element** at the root. This is exactly what we need to answer: "Is the new notification better than the worst item currently in the top N?" If yes, evict the worst and insert the new one.
+
+**Complexity summary:**
+
+| Operation | Time Complexity |
+|---|---|
+| Initial build from m notifications | O(m log N) |
+| Process one new incoming notification | O(log N) |
+| Read current top N (sorted) | O(N log N) |
+
+This design scales to millions of incoming notifications with N = 10, 15, or 20 — the heap size stays constant.
+
+
 
 
