@@ -238,3 +238,143 @@ data: {"id":"notif_03","type":"Result","title":"Semester results published","isR
 ```
 
 When a new notification is created via `POST /notifications`, the server fans it out to all connected SSE clients belonging to the target audience.
+
+---
+
+## Stage 2
+
+### Database Choice
+
+**PostgreSQL** is the recommended database for this platform.
+
+| Requirement | Why PostgreSQL fits |
+|---|---|
+| Structured, relational data | Students, notifications, and recipients have clear relationships |
+| ACID guarantees | A notification must be atomically stored before it is pushed to clients |
+| Complex queries | Filtering by type, read-status, date range, and pagination are standard SQL |
+| Enum support | `notificationType` maps directly to a PostgreSQL `ENUM` |
+| Scalability tools | Built-in partitioning, indexing, read replicas supported natively |
+
+---
+
+### Schema
+
+```sql
+CREATE TYPE notification_type AS ENUM ('Placement', 'Event', 'Result');
+
+CREATE TABLE students (
+  id          SERIAL PRIMARY KEY,
+  name        VARCHAR(100) NOT NULL,
+  email       VARCHAR(150) UNIQUE NOT NULL,
+  roll_no     VARCHAR(20) UNIQUE NOT NULL,
+  created_at  TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE notifications (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  type         notification_type NOT NULL,
+  title        VARCHAR(255) NOT NULL,
+  message      TEXT NOT NULL,
+  created_by   INTEGER REFERENCES students(id),
+  created_at   TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE notification_recipients (
+  id              SERIAL PRIMARY KEY,
+  notification_id UUID REFERENCES notifications(id) ON DELETE CASCADE,
+  student_id      INTEGER REFERENCES students(id) ON DELETE CASCADE,
+  is_read         BOOLEAN DEFAULT FALSE,
+  read_at         TIMESTAMP,
+  UNIQUE (notification_id, student_id)
+);
+
+CREATE INDEX idx_recipients_student ON notification_recipients (student_id);
+CREATE INDEX idx_recipients_unread  ON notification_recipients (student_id, is_read) WHERE is_read = FALSE;
+CREATE INDEX idx_notifications_type ON notifications (type);
+CREATE INDEX idx_notifications_created ON notifications (created_at DESC);
+```
+
+**Design rationale**: `notifications` stores the message once. `notification_recipients` is the fan-out junction table — one row per student per notification. This avoids duplicating the message content 50,000 times.
+
+---
+
+### Scaling Problems as Data Grows
+
+At 50,000 students and 5,000,000 notifications:
+
+| Problem | Root Cause |
+|---|---|
+| `notification_recipients` table bloat | 50k rows inserted per broadcast → tens of millions of rows quickly |
+| Slow unread-count queries | Full scan of `notification_recipients` per student without a partial index |
+| High write throughput on broadcast | 50,000 `INSERT` statements per "Notify All" action |
+| Index maintenance overhead | Every insert updates all indexes on the table |
+| `ORDER BY createdAt DESC` without index | Full sort on millions of rows |
+
+### Solutions
+
+1. **Partial index on unread**: `WHERE is_read = FALSE` — index shrinks as notifications are read
+2. **Table partitioning by `created_at`**: Archive old notifications to cold partitions; queries only touch recent partitions
+3. **Bulk insert for fan-out**: Replace 50k individual inserts with a single `INSERT INTO ... SELECT` from a student IDs array
+4. **Read replicas**: Route all `GET` queries to a replica; writes go to the primary
+5. **Soft-delete / archiving**: Move notifications older than 90 days to an `archived_notifications` table
+
+---
+
+### SQL Queries Mapped to Stage 1 APIs
+
+**GET /notifications** — paginated, filterable
+
+```sql
+SELECT
+  n.id,
+  n.type,
+  n.title,
+  n.message,
+  nr.is_read,
+  n.created_at
+FROM notification_recipients nr
+JOIN notifications n ON n.id = nr.notification_id
+WHERE nr.student_id = $1
+  AND ($2::notification_type IS NULL OR n.type = $2)
+  AND ($3::boolean IS NULL OR nr.is_read = $3)
+ORDER BY n.created_at DESC
+LIMIT $4 OFFSET $5;
+```
+
+**GET /notifications/unread-count**
+
+```sql
+SELECT COUNT(*) AS unread_count
+FROM notification_recipients
+WHERE student_id = $1
+  AND is_read = FALSE;
+```
+
+**PATCH /notifications/:id/read**
+
+```sql
+UPDATE notification_recipients
+SET is_read = TRUE, read_at = NOW()
+WHERE notification_id = $1
+  AND student_id = $2;
+```
+
+**PATCH /notifications/read-all**
+
+```sql
+UPDATE notification_recipients
+SET is_read = TRUE, read_at = NOW()
+WHERE student_id = $1
+  AND is_read = FALSE;
+```
+
+**POST /notifications** — fan-out insert
+
+```sql
+INSERT INTO notifications (type, title, message, created_by)
+VALUES ($1, $2, $3, $4)
+RETURNING id;
+
+INSERT INTO notification_recipients (notification_id, student_id)
+SELECT $1, id FROM students;
+```
