@@ -1,8 +1,10 @@
 "use strict";
 
 const { Log } = require("../../../logging_middleware");
-const { fetchDepots, fetchVehicles } = require("../../src/evaluationClient");
-const { scheduleForDepot } = require("../../src/scheduler");
+const { fetchDepots, fetchVehicles } = require("../evaluationClient");
+
+const { scheduleForDepot } = require("../scheduler");
+
 
 async function handleSchedule(req, res) {
   await Log("backend", "info", "handler", "POST /schedule — request received");

@@ -20,9 +20,19 @@ function assertLowercase(value, field) {
 const LEVEL_CONSOLE_MAP = {
   debug: "debug",
   info: "info",
+  warn: "warn",
   warning: "warn",
   error: "error",
   fatal: "error",
+};
+
+const LEVEL_API_MAP = {
+  debug: "debug",
+  info: "info",
+  warn: "warn",
+  warning: "warn",
+  error: "error",
+  fatal: "fatal",
 };
 
 async function Log(stack, level, pkg, message) {
@@ -42,7 +52,7 @@ async function Log(stack, level, pkg, message) {
 
   const payload = {
     stack,
-    level,
+    level: LEVEL_API_MAP[level] || level,
     package: pkg,
     message: message.length > 48 ? message.slice(0, 48) : message,
   };
