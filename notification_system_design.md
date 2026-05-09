@@ -499,3 +499,102 @@ ON notifications (type, created_at DESC);
 
 This allows PostgreSQL to scan only `Placement` rows within the last 7 days using an index range scan instead of a full table scan.
 
+---
+
+## Stage 4
+
+### Problem
+
+Notifications are fetched from the database on every page load for every student. At 50,000 concurrent students, this produces 50,000 DB read queries simultaneously — overwhelming the primary database and causing high latency and degraded user experience.
+
+---
+
+### Strategies and Tradeoffs
+
+#### 1. Redis Cache (Per-Student Notification List)
+
+**How it works**: When a student's notifications are fetched, the result is stored in Redis with the key `notifications:{student_id}` and a TTL (e.g. 60 seconds). Subsequent requests within the TTL window are served from Redis without hitting the DB. When a new notification is created for a student, their cache key is invalidated.
+
+| Benefit | Tradeoff |
+|---|---|
+| Eliminates repeated DB reads for the same student | Cache invalidation logic must be maintained — every write must invalidate the right keys |
+| Sub-millisecond response times from Redis | Stale data possible within the TTL window |
+| Scales horizontally (Redis cluster) | Additional infrastructure to deploy and monitor |
+| Reduces DB connection pressure significantly | Memory cost — large notification lists per student |
+
+**Recommendation: Use this.** Cache the paginated notification list with a short TTL (30–60s). On `POST /notifications`, invalidate the cache keys of all target students (or use a write-through pattern for small audiences).
+
+---
+
+#### 2. HTTP Cache-Control Headers
+
+**How it works**: Set `Cache-Control: max-age=30` on `GET /notifications` responses. The browser caches the response locally and skips the network request until the TTL expires.
+
+| Benefit | Tradeoff |
+|---|---|
+| Zero server cost for repeated requests within TTL | Cannot push real-time updates — browser shows stale data until TTL expires |
+| No extra infrastructure needed | Incompatible with the SSE real-time mechanism chosen in Stage 1 |
+| Works natively in browsers | Cannot invalidate from the server side mid-TTL |
+
+**Verdict**: Useful as a secondary layer for static assets, but insufficient as the primary caching strategy for real-time notifications.
+
+---
+
+#### 3. Pagination with Cursor-Based Navigation
+
+**How it works**: Instead of fetching all notifications, the client fetches a fixed page (e.g. 20 items). Each response includes a `cursor` pointing to the next page. The client only fetches more when the user scrolls.
+
+| Benefit | Tradeoff |
+|---|---|
+| Drastically reduces result set size per query | Not a caching strategy — still hits the DB on every fetch |
+| Reduces memory and bandwidth per request | Requires frontend pagination/infinite scroll implementation |
+| Pairs well with Redis (cache each page independently) | Cursor invalidation is complex when new notifications arrive |
+
+**Verdict**: Essential as a DB query strategy but not a substitute for caching.
+
+---
+
+#### 4. Database Read Replica
+
+**How it works**: Route all `GET /notifications` queries to a read replica of PostgreSQL. The primary handles only writes.
+
+| Benefit | Tradeoff |
+|---|---|
+| Offloads all read traffic from the primary DB | Replication lag (1–200ms) means replica may return slightly stale data |
+| No application-level cache to invalidate | Additional infrastructure and cost |
+| Scales read throughput independently | Does not reduce round-trips — each page load still queries the replica |
+
+**Verdict**: A good complementary strategy alongside Redis, not a standalone replacement.
+
+---
+
+### Recommended Architecture
+
+```
+Student Page Load
+      │
+      ▼
+ Redis Cache ──── HIT ──▶ Return cached notifications
+      │
+     MISS
+      │
+      ▼
+ PostgreSQL Read Replica ──▶ Return results ──▶ Store in Redis (TTL: 60s)
+
+POST /notifications (new notification created)
+      │
+      ▼
+ Write to PostgreSQL Primary
+      │
+      ▼
+ Invalidate Redis keys for all target students
+      │
+      ▼
+ Push event to SSE-connected clients
+```
+
+**Cache key format**: `notifs:{student_id}:page:{page}:type:{type}:unread:{isRead}`
+
+**TTL**: 60 seconds for the notification list; no TTL for the unread count (invalidate immediately on every read/write event).
+
+
