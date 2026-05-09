@@ -597,4 +597,148 @@ POST /notifications (new notification created)
 
 **TTL**: 60 seconds for the notification list; no TTL for the unread count (invalidate immediately on every read/write event).
 
+---
+
+## Stage 5
+
+### Proposed Implementation Under Review
+
+```
+function notify_all(student_ids: array, message: string):
+    for student_id in student_ids:
+        send_email(student_id, message)   # calls Email API
+        save_to_db(student_id, message)   # DB insert
+        push_to_app(student_id, message)  # real-time push
+```
+
+---
+
+### Shortcomings
+
+| Problem | Explanation |
+|---|---|
+| **Synchronous loop over 50,000 students** | Each iteration blocks on three operations before moving to the next student. Sending 50k emails sequentially could take hours |
+| **No fault isolation** | If `send_email` fails for student #300, the entire loop stops — students #301–50,000 receive nothing |
+| **No retry mechanism** | Failed email calls are permanently lost with no way to re-attempt |
+| **Sequential DB inserts** | 50,000 individual `save_to_db` calls means 50,000 round-trips to the database; should be a single bulk insert |
+| **No idempotency** | If the process crashes and is restarted, students already processed get duplicate notifications |
+| **Email API and DB tightly coupled** | If the Email API is slow (common), it blocks the DB insert for every student — even if DB is healthy |
+
+---
+
+### What Happened When Email Failed for 200 Students Midway?
+
+With the current implementation:
+- The loop exits at the first unhandled error
+- Students #300–50,000 (or whichever 200 failed and all after) receive no notification
+- There is no record of who was processed and who was not
+- A re-run would duplicate notifications for students already processed
+
+---
+
+### Redesigned Approach — Message Queue with Worker Pool
+
+**Core principle**: decouple the three operations. Each student notification is an independent, retryable unit of work.
+
+#### Step 1 — Bulk save to DB first (single transaction)
+
+```
+INSERT INTO notification_recipients (notification_id, student_id)
+SELECT notification_id, id FROM students;
+```
+
+The notification is atomically persisted for all 50,000 students in one query. DB is the source of truth — even if everything else fails, the data is safe.
+
+#### Step 2 — Enqueue email jobs (do not send inline)
+
+Push one job per student into a message queue (e.g. Bull with Redis, RabbitMQ, or AWS SQS):
+
+```
+for student_id in student_ids:
+    email_queue.push({ student_id, message, notification_id })
+```
+
+This loop is now fast — it only enqueues, it does not send.
+
+#### Step 3 — Workers consume and send concurrently
+
+Worker processes pull jobs from the queue and call the Email API with configurable concurrency (e.g. 100 workers in parallel):
+
+```
+worker.process(concurrency=100, job => {
+    send_email(job.student_id, job.message)
+})
+```
+
+Failed jobs are retried with exponential backoff. After N retries, the job moves to a dead-letter queue for manual inspection.
+
+#### Step 4 — Real-time push is independent
+
+`push_to_app` fires via SSE immediately after the DB insert in Step 1, not after email — these are separate concerns.
+
+---
+
+### Should DB Save and Email Happen Together?
+
+**No — they must be decoupled.** Here is why:
+
+| Concern | Explanation |
+|---|---|
+| **Different failure modes** | DB inserts are fast and highly reliable. Email APIs are slow and frequently fail or rate-limit |
+| **Different latency requirements** | The in-app notification must appear instantly; email delivery can tolerate a delay of seconds or minutes |
+| **Atomicity mismatch** | You cannot roll back a sent email if the DB insert fails. Doing them together creates an inconsistent state either way |
+| **DB is the source of truth** | Save to DB first, always. If email fails, you can re-derive the recipient list from the DB and retry |
+
+---
+
+### Revised Pseudocode
+
+```
+function notify_all(student_ids: array, message: string):
+
+    # Step 1: Persist atomically — one bulk insert
+    notification_id = db.insert_notification(message)
+    db.bulk_insert_recipients(notification_id, student_ids)
+
+    # Step 2: Push real-time events to connected SSE clients
+    for student_id in student_ids:
+        sse_server.push(student_id, { notification_id, message })
+
+    # Step 3: Enqueue email jobs — fast, non-blocking
+    for student_id in student_ids:
+        email_queue.enqueue({
+            job_id: uuid(),               # idempotency key
+            student_id: student_id,
+            notification_id: notification_id,
+            message: message,
+            retry_count: 0,
+            max_retries: 5
+        })
+
+    return { queued: len(student_ids), notification_id: notification_id }
+
+
+# Worker (runs in a separate process pool, concurrency = 100)
+function email_worker(job):
+    try:
+        send_email(job.student_id, job.message)
+        job.mark_complete()
+    catch EmailAPIError as err:
+        if job.retry_count < job.max_retries:
+            delay = exponential_backoff(job.retry_count)
+            email_queue.requeue(job, delay=delay)
+        else:
+            dead_letter_queue.push(job)
+            log_failure(job.student_id, err)
+```
+
+**Key guarantees of the revised design**:
+- DB insert is atomic — all 50,000 records saved or none
+- Email failure for 200 students does not affect the other 49,800
+- Failed jobs are retried automatically up to 5 times with backoff
+- Permanently failed jobs land in a dead-letter queue for inspection
+- Idempotency key (`job_id`) prevents duplicate emails if a worker crashes mid-send and the job is requeued
+- Real-time SSE push is instant and independent of email delivery time
+
+
 
