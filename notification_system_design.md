@@ -378,3 +378,124 @@ RETURNING id;
 INSERT INTO notification_recipients (notification_id, student_id)
 SELECT $1, id FROM students;
 ```
+
+---
+
+## Stage 3
+
+### Query Under Review
+
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt DESC;
+```
+
+---
+
+### Is This Query Accurate?
+
+No — there are two issues beyond performance:
+
+1. `SELECT *` fetches every column including potentially large `message` (TEXT) fields. Only the columns actually needed by the frontend should be selected.
+2. Based on the schema designed in Stage 2, `studentID` and `isRead` live in `notification_recipients`, not in `notifications`. The query as written would either fail or produce wrong results. The correct version must JOIN both tables.
+
+---
+
+### Why Is It Slow?
+
+At 5,000,000 rows in `notification_recipients`:
+
+| Reason | Impact |
+|---|---|
+| No composite index on `(studentID, isRead, createdAt)` | Full table scan — PostgreSQL reads every row to find matches |
+| `SELECT *` fetches full rows | More I/O; rows with large TEXT fields are expensive to load |
+| `ORDER BY createdAt DESC` without a supporting index | Database sorts all matched rows in memory |
+| `isRead = false` is low-selectivity without a partial index | Even with a single-column index on `studentID`, the planner may skip it |
+
+**Estimated cost without index**: O(n) — linear scan over millions of rows.
+
+---
+
+### What to Change
+
+**1. Fix the query — use the correct schema**
+
+```sql
+SELECT
+  n.id,
+  n.type,
+  n.title,
+  n.message,
+  nr.is_read,
+  n.created_at
+FROM notification_recipients nr
+JOIN notifications n ON n.id = nr.notification_id
+WHERE nr.student_id = 1042
+  AND nr.is_read = false
+ORDER BY n.created_at DESC;
+```
+
+**2. Add a composite index**
+
+```sql
+CREATE INDEX idx_recipients_student_unread_date
+ON notification_recipients (student_id, is_read, notification_id);
+```
+
+**3. Better: use a partial index (only indexes unread rows)**
+
+```sql
+CREATE INDEX idx_recipients_unread
+ON notification_recipients (student_id)
+WHERE is_read = FALSE;
+```
+
+This index automatically shrinks as students read their notifications — far more space-efficient than a full index.
+
+---
+
+### Computation Cost After Fix
+
+| State | Strategy | Cost |
+|---|---|---|
+| Without index | Full sequential scan | O(n) — millions of row reads |
+| With composite index | B-tree lookup by student_id + is_read | O(log n) lookup + O(k) result rows |
+| With partial index (is_read = FALSE) | B-tree on much smaller dataset | O(log m) where m << n |
+
+---
+
+### Should You Index Every Column?
+
+**No — this is bad advice.** Here is why:
+
+| Concern | Explanation |
+|---|---|
+| Write amplification | Every `INSERT` and `UPDATE` must update all indexes — 50k inserts per broadcast becomes extremely slow |
+| Storage overhead | Each index duplicates column data on disk |
+| Query planner confusion | PostgreSQL's planner may choose a suboptimal index when too many exist |
+| Low-selectivity indexes are useless | An index on a boolean column like `is_read` has near-zero benefit without a partial filter |
+
+The correct approach is to index **only the columns and combinations that appear in your actual WHERE and ORDER BY clauses**, and prefer partial indexes where possible.
+
+---
+
+### Query: Students Who Received a Placement Notification in the Last 7 Days
+
+```sql
+SELECT DISTINCT nr.student_id
+FROM notification_recipients nr
+JOIN notifications n ON n.id = nr.notification_id
+WHERE n.type = 'Placement'
+  AND n.created_at >= NOW() - INTERVAL '7 days';
+```
+
+**Supporting index for this query:**
+
+```sql
+CREATE INDEX idx_notifications_type_date
+ON notifications (type, created_at DESC);
+```
+
+This allows PostgreSQL to scan only `Placement` rows within the last 7 days using an index range scan instead of a full table scan.
+
